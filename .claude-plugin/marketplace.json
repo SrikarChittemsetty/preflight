@@ -1,0 +1,14 @@
+{
+  "name": "preflight",
+  "description": "Preflight: plain-English, per-session permission approvals for Claude Code.",
+  "owner": {
+    "name": "Srikar Chittemsetty"
+  },
+  "plugins": [
+    {
+      "name": "preflight",
+      "source": "./",
+      "description": "Approve tool calls by category in plain English so sessions run unattended without permission popups."
+    }
+  ]
+}

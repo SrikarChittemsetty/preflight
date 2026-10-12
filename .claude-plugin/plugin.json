@@ -1,0 +1,8 @@
+{
+  "name": "preflight",
+  "version": "0.1.0",
+  "description": "Approve tool calls by category in plain English (\"web is fine, never email anyone\") so sessions run unattended without permission popups.",
+  "author": { "name": "Srikar Chittemsetty" },
+  "license": "MIT",
+  "keywords": ["permissions", "hooks", "unattended", "approvals"]
+}
