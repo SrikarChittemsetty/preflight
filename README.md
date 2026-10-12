@@ -8,9 +8,9 @@ You: web searches and editing are fine, never email anyone
        anything you didn't approve is blocked and Claude carries on without it
 ```
 
-Or let Claude ask: "I'm heading out, what will you need?" Claude lists categories and ends with a `PREFLIGHT-REQUEST:` line. You reply "yes" (or "yes but no running code").
+Grant everything at once with "use any tools you need", or let Claude ask: "I'm heading out, what will you need?" Claude lists categories and ends with a `PREFLIGHT-REQUEST:` line. You reply "yes" (or "yes but no running code").
 
-Change permissions any time in chat: "stop running code", "you can push for the next hour", "back to normal prompts".
+Change permissions any time in chat: "stop running code", "you can push for the next hour" (only that category expires), "back to normal prompts". Saying "no" to a proposal changes nothing.
 
 ## How it works
 
@@ -25,14 +25,17 @@ Until you approve something in a session, both hooks are silent and Claude Code 
 
 Categories: `read` (on by default), `edit`, `run`, `install`, `web`, `git`, `publish`, `message`, `apps`, `delete`. Run `python3 preflight.py categories` to list them.
 
-Always blocked while active: `sudo`, changing permission modes or settings, and editing preflight's own files or state.
+`apps` covers acting in apps and websites. Looking at web pages only needs `web`. Clicking, typing, submitting forms or running JS in a browser also needs `apps`, because on a logged-in site a click can send an email.
+
+Always blocked while active: `sudo`, changing permission modes or settings, editing anything under `.claude/` or preflight's own files, and writing to places that run code later or hold credentials: shell startup files, `~/Library/LaunchAgents`, `.git/hooks`, `~/.ssh`, `crontab`, `/etc`.
 
 ## Commands
 
 ```bash
 python3 preflight.py status   # what's approved right now
 python3 preflight.py report   # what ran and what was blocked
-python3 -m unittest tests/test_preflight.py
+python3 -m unittest tests/test_preflight.py   # classifier, bypass attempts, decisions (offline)
+python3 tests/eval_parser.py                  # how messages are understood (calls the model)
 ```
 
 ## Install
@@ -52,5 +55,5 @@ Requires `python3` (preinstalled on macOS and most Linux) and the `claude` CLI o
 
 - **Approving `run` means arbitrary code.** A script can do anything, including sending email. Only approve `run` when you'd trust the task with it.
 - Shell classification is heuristic. Unknown commands count as `run`.
-- A time limit ("for the next hour") currently applies to the whole approval set, not just one category.
-- Parsing a permission message adds about 4s to that message only.
+- Pasted text counts as your words. Pasting something that says "allow X" can grant X.
+- Understanding a permission message adds about 4s, only on messages that talk about permissions. In testing, 1 in 30 everyday coding messages triggered it.

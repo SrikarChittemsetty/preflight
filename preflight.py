@@ -40,7 +40,7 @@ CATEGORIES = {
     "git":     "🔀 Local git: commit, branch, stash",
     "publish": "🚀 Push, deploy, post publicly, send data to servers",
     "message": "✉️ Message people: email, Slack, DMs",
-    "apps":    "🧩 Change things in connected apps (drafts, labels, docs)",
+    "apps":    "🧩 Act in apps and websites: click, type, submit forms, drafts, labels, docs",
     "delete":  "🗑️ Delete files or data",
 }
 # Reading is on by default once preflight is active, unless the user blocks it.
@@ -127,7 +127,8 @@ def classify(tool_name: str, tool_input: dict) -> Set[str]:
     if tool_name in TOOL_CATEGORIES:
         return {TOOL_CATEGORIES[tool_name]}
     if tool_name.startswith("mcp__"):
-        return {classify_mcp(tool_name)}
+        cat = classify_mcp(tool_name, tool_input)
+        return {"web", "apps"} if cat == "web+apps" else {cat}
     return {"run"}  # unknown tool: needs an explicit approval
 
 
@@ -140,17 +141,24 @@ MCP_VERBS = {
 }
 
 
-def classify_mcp(tool_name: str) -> str:
+def classify_mcp(tool_name: str, tool_input: dict) -> str:
     server, _, action = tool_name[len("mcp__"):].partition("__")
     action = action.lower()
     if re.search(r"permission_mode|set_setting", action):
         return FORBIDDEN
     if server in ("Claude_Browser", "claude-in-chrome") or "browser" in server.lower():
-        return "web"
+        return classify_browser(action, tool_input)
     if server.startswith("ccd_"):
         return INTERNAL  # the desktop app's own session/view tools
     if server == "computer-use":
-        return "apps"
+        return "read" if re.match(r"^(app_)?(screenshot|zoom|list_\w+|read_clipboard|app_ax_find)$",
+                                  action) else "apps"
+    tokens = set(action.split("_"))
+    changes = tokens & {"create", "add", "update", "edit", "merge", "submit", "post", "send"}
+    if changes and tokens & {"event", "events", "invite", "invitation", "meeting"}:
+        return "message"  # calendar changes email the attendees
+    if changes and tokens & {"pull", "pr", "issue", "comment", "review", "release", "post", "tweet"}:
+        return "publish"  # visible to other people
     for token in action.split("_"):
         for category, verbs in MCP_VERBS.items():
             if token in verbs:
@@ -158,10 +166,35 @@ def classify_mcp(tool_name: str) -> str:
     return "apps"
 
 
+BROWSER_LOOK = {"navigate", "get_page_text", "read_page", "find", "tabs_context", "tabs_context_mcp",
+                "tabs_create", "tabs_create_mcp", "tabs_select", "tabs_close", "tabs_close_mcp",
+                "read_console_messages", "read_network_requests", "resize_window", "preview_list",
+                "preview_logs", "list_connected_browsers", "select_browser", "switch_browser",
+                "shortcuts_list", "gif_creator"}
+COMPUTER_LOOK = {"screenshot", "zoom", "scroll", "scroll_to", "hover", "wait"}
+
+
+def classify_browser(action: str, tool_input: dict) -> str:
+    """Looking at pages is "web". Clicking, typing, forms and JS act as you on
+    logged-in sites (a click can send an email), so they also need "apps"."""
+    if action in BROWSER_LOOK:
+        return "web"
+    if action in ("preview_start", "preview_stop"):
+        return "run"
+    if action == "computer":
+        return "web" if tool_input.get("action") in COMPUTER_LOOK else "web+apps"
+    if action == "browser_batch":
+        steps = tool_input.get("actions") or []
+        looks = all(st.get("name") in BROWSER_LOOK or (st.get("name") == "computer" and
+                    (st.get("input") or {}).get("action") in COMPUTER_LOOK) for st in steps)
+        return "web" if looks else "web+apps"
+    return "web+apps"
+
+
 READ_CMDS = {
     "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "rg", "fd", "wc",
     "pwd", "echo", "printf", "which", "whoami", "date", "file", "stat", "du", "df",
-    "tree", "sort", "uniq", "cut", "awk", "diff", "jq", "env", "printenv", "true",
+    "tree", "sort", "uniq", "cut", "diff", "jq", "env", "printenv", "true",
     "false", "test", "[", "basename", "dirname", "realpath", "readlink", "type",
     "man", "ps", "cd", "sleep", "uname", "hostname", "md5", "shasum", "column", "tr",
 }
@@ -169,6 +202,10 @@ EDIT_CMDS = {"mkdir", "touch", "cp", "mv", "ln", "tee", "chmod", "chown", "patch
 DELETE_CMDS = {"rm", "rmdir", "unlink", "trash", "shred"}
 REMOTE_CMDS = {"ssh", "scp", "rsync", "sftp"}
 MESSAGE_CMDS = {"mail", "mailx", "sendmail", "mutt"}
+SHELL_KEYWORDS = {"if", "then", "else", "elif", "while", "until", "do", "!", "{", "time"}
+SHELL_CLOSERS = {"fi", "done", "esac", "}"}
+SHELL_BUILTINS = {"export", "unset", "alias", "set", "declare", "local", "readonly", "shopt",
+                  "wait", "return", "exit", "break", "continue", "trap", ":"}
 WRAPPERS = {"nohup", "time", "exec", "command", "nice", "caffeinate"}
 PKG_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 INSTALL_VERBS = {"install", "i", "add", "ci", "update", "upgrade"}
@@ -223,10 +260,14 @@ def classify_bash(cmd: str) -> Set[str]:
 def classify_segment(words: List[str]) -> Set[str]:
     while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
         words = words[1:]  # FOO=bar cmd
-    while words and os.path.basename(words[0]) in WRAPPERS:
-        words = words[1:]
-    if not words:
+    while words and (os.path.basename(words[0]) in WRAPPERS or words[0] in SHELL_KEYWORDS):
+        words = words[1:]  # nohup cmd / if cmd / do cmd
+    if not words or words[0] in SHELL_CLOSERS:
         return set()
+    if words[0] in ("for", "select", "case"):
+        return {"read"}  # loop/case header: `for f in *.py`
+    if words[0] in SHELL_BUILTINS:
+        return {"read"}
     name = os.path.basename(words[0])
     args = words[1:]
     sub = next((a for a in args if not a.startswith("-")), "")
@@ -245,9 +286,16 @@ def classify_segment(words: List[str]) -> Set[str]:
     if name == "sed":
         return {"edit"} if any(a.startswith("-i") for a in args) else {"read"}
     if name == "find":
-        if "-delete" in args or ("-exec" in args and any(a in DELETE_CMDS for a in args)):
-            return {"delete"}
-        return {"read"}
+        cats = {"delete"} if "-delete" in args else set()
+        for flag in ("-exec", "-execdir", "-ok", "-okdir"):
+            if flag in args:
+                cmd_words = args[args.index(flag) + 1:]
+                end = next((i for i, a in enumerate(cmd_words) if a in (";", "+", "\\;")), len(cmd_words))
+                cats |= classify_segment([w for w in cmd_words[:end] if w != "{}"])
+        return cats or {"read"}
+    if name in ("awk", "gawk", "nawk"):
+        script = " ".join(args)
+        return {"run"} if re.search(r"system\s*\(|getline|\|\s*\"|>\s*\"", script) else {"read"}
     if name in DELETE_CMDS:
         return {"delete"}
     if name in EDIT_CMDS:
@@ -265,7 +313,13 @@ def classify_segment(words: List[str]) -> Set[str]:
                     for a in args)
         sends = sends or any(a == "-X" and args[j + 1].upper() in ("POST", "PUT", "PATCH", "DELETE")
                              for j, a in enumerate(args[:-1]))
-        return {"publish"} if sends else {"web"}
+        if sends:
+            return {"publish"}
+        saves = (name == "wget" and not re.search(r"-O\s*-|-qO-", " ".join(args))) or any(
+            re.match(r"^(-o|-O|--output|--remote-name|-[a-zA-Z]*[oO])$", a) for a in args)
+        return {"web", "edit"} if saves else {"web"}
+    if name == "yarn" and not args:
+        return {"install"}
     if name in PKG_MANAGERS:
         if sub in INSTALL_VERBS:
             return {"install"}
@@ -298,6 +352,8 @@ def classify_segment(words: List[str]) -> Set[str]:
 
 
 def classify_git(args: List[str]) -> Set[str]:
+    if any(a in ("-c", "--config-env", "--exec-path") or a.startswith("--exec-path=") for a in args):
+        return {"run"}  # git config overrides can run arbitrary programs
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in ("-C", "-c") else 1
@@ -332,24 +388,33 @@ def classify_gh(args: List[str]) -> Set[str]:
     return {"web"}
 
 
+# Writing here runs code later (shell startup, login items, git hooks, cron) or
+# touches credentials, so it's never allowed while preflight is active.
+RC_FILES = {".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile", ".profile"}
+AUTORUN_IN_COMMAND = re.compile(
+    r"(^|[\s/'\"=])\.(zshrc|zshenv|zprofile|zlogin|bashrc|bash_profile|profile)\b"
+    r"|Launch(Agents|Daemons)|\.git/hooks|\.ssh/|\bcrontab\b|(^|[\s'\"=])/(private/)?etc/")
+
+
 def protected_markers() -> List[str]:
-    return [str(STATE_DIR), ".claude/preflight", ".claude/settings", "settings.local.json",
-            str(HERE), "preflight.py", "hooks.json", ".claude/plugins"]
+    return [str(STATE_DIR), ".claude/", str(HERE), "preflight.py", "hooks.json"]
 
 
 def touches_protected(cmd: str) -> bool:
     expanded = cmd.replace("~", str(Path.home()))
-    return any(m in expanded for m in protected_markers())
+    return any(m in expanded for m in protected_markers()) or bool(AUTORUN_IN_COMMAND.search(expanded))
 
 
 def is_protected_path(path: str) -> bool:
     if not path:
         return False
     p = Path(os.path.expanduser(path)).resolve()
-    plugins_dir = Path.home() / ".claude" / "plugins"
-    if HERE in p.parents or STATE_DIR in p.parents or plugins_dir in p.parents:
+    if HERE in p.parents or STATE_DIR in p.parents or ".claude" in p.parts:
         return True
-    return p.parent.name == ".claude" and p.name.startswith("settings")
+    parts = p.parts
+    return (p.name in RC_FILES or ".ssh" in parts or "LaunchAgents" in parts or "LaunchDaemons" in parts
+            or any(a == ".git" and b == "hooks" for a, b in zip(parts, parts[1:]))
+            or str(p).startswith(("/etc/", "/private/etc/")))
 
 
 # ---------------------------------------------------------------- enforcement
@@ -360,10 +425,15 @@ def decide(state: dict, cats: Set[str]):
         return "deny", {FORBIDDEN}
     if cats <= {INTERNAL}:
         return "allow", set()
-    cats = cats - {INTERNAL}
-    allowed = (set(state.get("allow", [])) | DEFAULT_ALLOWED) - set(state.get("deny", []))
-    missing = cats - allowed
+    missing = (cats - {INTERNAL}) - allowed_categories(state)
     return ("deny", missing) if missing else ("allow", set())
+
+
+def allowed_categories(state: dict) -> Set[str]:
+    """Approved categories right now, minus any whose own time limit has passed."""
+    until = state.get("until", {})
+    allowed = (set(state.get("allow", [])) | DEFAULT_ALLOWED) - set(state.get("deny", []))
+    return {c for c in allowed if c not in until or datetime.fromisoformat(until[c]) > now()}
 
 
 def deny_reason(missing: Set[str]) -> str:
@@ -413,10 +483,22 @@ REQUEST_LINE = re.compile(r"PREFLIGHT-REQUEST:\s*(.+)", re.I)
 AFFIRMATIVE = re.compile(
     r"^\s*(y|yes|yeah|yep|yup|sure|ok|okay|approved?|go ahead|go for it|sounds good|do it|lgtm"
     r"|that'?s fine|all good)\b[\s.!]*$", re.I)
+# Phrases that grant, block or talk about permissions. Kept specific on purpose:
+# a match costs a ~4s model call, so everyday task wording ("ok now commit it",
+# "don't touch the API") must not trip it.
+NEGATIVE = re.compile(r"^\s*(no|nope|nah|not now|not yet|cancel|hold off|never ?mind)\b[\s.!]*$", re.I)
 PERMISSION_WORDS = re.compile(
-    r"\b(allow|approve|pre-?approve|permission|permit|go ahead|fine|ok|okay|don'?t|do not|never"
-    r"|stop|block|revoke|forbid|not allowed|can'?t|cannot|no more|yes|yeah|yep|sure|preflight"
-    r"|allowed to|heading out|leaving|while i'?m (gone|away|out))\b", re.I)
+    r"\b(allow\w*|approv\w*|pre-?approv\w*|permission\w*|permit\w*|forbid\w*|revok\w*|block\w*"
+    r"|off.?limits|(is|are|'s) (fine|ok|okay|allowed|good)|(ok|okay|fine) (to|with)|feel free"
+    r"|you (can|may|could)|you'?re (allowed|free)|go ahead|i trust you"
+    r"|(don'?t|do not|never) (let|allow)|never|no more"
+    r"|stop (letting|using|running|installing|pushing|sending|deleting|editing|browsing)"
+    r"|heading out|stepping (out|away)|leaving|be(ing)? (gone|away|afk)|while i'?m (gone|away|out)"
+    r"|preflight)\b", re.I)
+# Grants of everything at once, which name no category.
+BROAD_GRANT = re.compile(
+    r"\b(any (tools?|commands?|actions?|permissions?)|whatever you (need|want)"
+    r"|anything you (need|want)|everything you need|all (the )?(tools|permissions))\b", re.I)
 CATEGORY_WORDS = {
     "web": r"web|internet|online|search(es|ing)?|brows\w*|google|websites?|urls?|fetch",
     "message": r"e-?mails?|gmail|mail|slack|messages?|messaging|dms?|text(ing)?|people",
@@ -473,12 +555,22 @@ The user's message:
 
 Rules:
 - Only the USER's words grant or block. Use the assistant's message only to resolve what a short reply such as "yes" or "yes but not X" refers to (for example a PREFLIGHT-REQUEST line it proposed).
-- "allow": ONLY categories the user explicitly states are fine/approved/allowed. "deny": categories the user forbids or revokes.
-- Task instructions are NOT approvals. "Delete old.txt" or "run the tests" inside a task does not allow delete or run. When in doubt, leave a category out; anything not allowed gets blocked safely.
+- "allow": ONLY categories the user explicitly says are fine/approved/allowed, or that they tell you that you can/may do. "deny": ONLY categories the user specifically forbids or revokes.
+- Task instructions are NOT approvals. "Delete old.txt" or "run the tests" as a step of a task does not allow delete or run. When in doubt, leave a category out; anything not allowed is blocked safely.
+- "Nothing else" / "only that" means the remaining categories stay unapproved. Do NOT list them in "deny".
+- Granting everything ("use any tools you need", "do whatever you need") means allow every category. "Everything except X" means allow all others and deny X.
 - Broad phrases map to every fitting category ("anything on the web" -> web; "don't contact anyone" -> message).
 - "hours": a number if the user set a time limit, otherwise null.
 - "off": true only if the user wants preflight turned off / normal permission prompts back.
-- If the message doesn't change permissions (e.g. it's just a task, or a question about permissions), return {{"change": false}}.
+- If the message doesn't change permissions (just a task, a question about permissions, a pasted log, or "no" to a proposal), return {{"change": false}}.
+
+Examples:
+"web and editing files are fine, nothing else" -> {{"change": true, "allow": ["web","edit"], "deny": [], "hours": null, "off": false}}
+"use any tools you need" -> allow all ten categories
+"yes but no running code" after "PREFLIGHT-REQUEST: allow=web,run deny=message" -> {{"change": true, "allow": ["web"], "deny": ["run","message"], "hours": null, "off": false}}
+"you can push for the next hour" -> {{"change": true, "allow": ["publish"], "deny": [], "hours": 1, "off": false}}
+"fix the bug and don't touch the public API" -> {{"change": false}}
+"delete the old files and rerun the build" -> {{"change": false}}
 
 Reply with only JSON, no prose: {{"change": true, "allow": [], "deny": [], "hours": null, "off": false}}"""
     env = dict(os.environ, PREFLIGHT_CHILD="1")
@@ -544,14 +636,34 @@ def understand(user_text: str, assistant_text: str) -> Optional[dict]:
         proposal = parse_request_line(assistant_text)
         if proposal:
             return proposal
+    if OFF_WORDS.search(user_text):
+        return {"change": True, "allow": [], "deny": [], "hours": None, "off": True}
+    if NEGATIVE.match(user_text):
+        return None  # "no" to a proposal: leave things as they are
+    if BROAD_GRANT.search(user_text) and not re.search(r"\b(except|but|other than|besides|apart from)\b"
+                                                       r"|" + NEGATION.pattern, user_text, re.I):
+        return {"change": True, "allow": sorted(CATEGORIES), "deny": [], "hours": None, "off": False}
+    replying_to_proposal = bool(REQUEST_LINE.search(assistant_text)) and len(user_text) < 300
     if not (OFF_WORDS.search(user_text)
-            or (PERMISSION_WORDS.search(user_text) and ANY_CATEGORY_WORD.search(user_text))
-            or (PERMISSION_WORDS.search(user_text) and REQUEST_LINE.search(assistant_text))):
+            or BROAD_GRANT.search(user_text)
+            or replying_to_proposal
+            or (PERMISSION_WORDS.search(user_text) and ANY_CATEGORY_WORD.search(user_text))):
         return None  # not about permissions; don't spend a model call on it
     parsed = parse_with_model(user_text, assistant_text)
     if parsed is None:
         parsed = parse_with_keywords(user_text)
-    return parsed if parsed.get("change") else None
+    if not parsed.get("change"):
+        return None
+    # Safety net: a clear "don't X" the model missed still blocks X. Erring
+    # toward an extra block is safe; it never removes something the model allowed.
+    keyword_denies = parse_with_keywords(user_text)["deny"]
+    allowed = set(parsed.get("allow") or [])
+    parsed["deny"] = sorted(set(parsed.get("deny") or []) | (set(keyword_denies) - allowed))
+    # "Nothing else" must not switch off reading, which is on by default.
+    deny = parsed["deny"]
+    if "read" in deny and not re.search(r"\b(read\w*|look(ing)? at|open\w*)\b", user_text, re.I):
+        parsed["deny"] = [c for c in deny if c != "read"]
+    return parsed
 
 
 def apply_change(state: Optional[dict], session_id: str, change: dict, user_text: str) -> dict:
@@ -561,18 +673,31 @@ def apply_change(state: Optional[dict], session_id: str, change: dict, user_text
     state["off"] = bool(change.get("off"))
     allow = set(state.get("allow", []))
     deny = set(state.get("deny", []))
-    for cat in change.get("allow") or []:
-        if cat in CATEGORIES:
-            allow.add(cat)
-            deny.discard(cat)
+    until = dict(state.get("until", {}))
+    hours = float(change["hours"]) if change.get("hours") else None
+    granted = [c for c in change.get("allow") or [] if c in CATEGORIES]
+    for cat in granted:
+        allow.add(cat)
+        deny.discard(cat)
+        until.pop(cat, None)
     for cat in change.get("deny") or []:
         if cat in CATEGORIES:
             deny.add(cat)
             allow.discard(cat)
-    state["allow"], state["deny"] = sorted(allow), sorted(deny)
-    hours = change.get("hours") or DEFAULT_HOURS
-    if change.get("hours") or "expires_at" not in state:
-        state["expires_at"] = (now() + timedelta(hours=float(hours))).isoformat(timespec="seconds")
+            until.pop(cat, None)
+    if "expires_at" not in state:
+        state["expires_at"] = (now() + timedelta(hours=DEFAULT_HOURS)).isoformat(timespec="seconds")
+    if hours and granted:
+        # "you can push for the next hour" limits just what was granted
+        limit = now() + timedelta(hours=hours)
+        for cat in granted:
+            until[cat] = limit.isoformat(timespec="seconds")
+        if limit > datetime.fromisoformat(state["expires_at"]):
+            state["expires_at"] = limit.isoformat(timespec="seconds")
+    elif hours:
+        # "preflight for 2 hours" limits the whole session
+        state["expires_at"] = (now() + timedelta(hours=hours)).isoformat(timespec="seconds")
+    state["allow"], state["deny"], state["until"] = sorted(allow), sorted(deny), until
     state.setdefault("history", []).append({
         "ts": now().isoformat(timespec="seconds"), "said": user_text[:300],
         "allow": change.get("allow") or [], "deny": change.get("deny") or [], "off": state["off"]})
@@ -582,9 +707,14 @@ def apply_change(state: Optional[dict], session_id: str, change: dict, user_text
 def describe(state: dict) -> str:
     if not is_active(state):
         return "Preflight is off: normal permission prompts apply."
-    allowed = (set(state["allow"]) | DEFAULT_ALLOWED) - set(state["deny"])
-    expires = datetime.fromisoformat(state["expires_at"]).astimezone().strftime("%-I:%M %p")
-    lines = ["Allowed without asking: " + ", ".join(CATEGORIES[c] for c in sorted(allowed))]
+    def clock(iso: str) -> str:
+        return datetime.fromisoformat(iso).astimezone().strftime("%-I:%M %p")
+
+    until = state.get("until", {})
+    allowed = [CATEGORIES[c] + (f" (until {clock(until[c])})" if c in until else "")
+               for c in sorted(allowed_categories(state))]
+    expires = clock(state["expires_at"])
+    lines = ["Allowed without asking: " + ", ".join(allowed)]
     if state["deny"]:
         lines.append("Explicitly blocked: " + ", ".join(CATEGORIES[c] for c in state["deny"]))
     lines.append("Everything else is blocked (no popups). Approvals expire at " + expires + ".")
@@ -613,7 +743,7 @@ def hook_prompt(payload: dict) -> Optional[dict]:
                    + describe(state)
                    + "\nTell the user in one or two lines what is now allowed and blocked, then continue.")
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
-    if is_active(state) or PERMISSION_WORDS.search(user_text):
+    if is_active(state) or PERMISSION_WORDS.search(user_text) or BROAD_GRANT.search(user_text):
         context = GUIDE + ("\nCurrent preflight state:\n" + describe(state) if state else "")
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
     return None
